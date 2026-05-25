@@ -14,3 +14,4 @@ venv/
 bot.log
 nohup.out
 events.json
+user_states.json

@@ -11,7 +11,14 @@ import os
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в .env файле!")
+
 EVENTS_FILE = 'events.json'
+STATE_FILE = 'user_states.json'
+
+# Блокировка для безопасной работы с файлами
+file_lock = threading.Lock()
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -20,18 +27,60 @@ def init_storage():
     if not os.path.exists(EVENTS_FILE):
         with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
             json.dump({'events': [], 'last_id': 0}, f, ensure_ascii=False, indent=2)
+    if not os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({}, f, ensure_ascii=False, indent=2)
 
 def load_events():
-    with open(EVENTS_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    with file_lock:
+        try:
+            with open(EVENTS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f'Ошибка чтения events.json: {e}')
+            # Возвращаем пустую структуру
+            return {'events': [], 'last_id': 0}
 
 def save_events(data):
-    with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    with file_lock:
+        try:
+            with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f'Ошибка записи events.json: {e}')
+
+def load_user_state(user_id):
+    with file_lock:
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                states = json.load(f)
+                return states.get(str(user_id))
+        except (json.JSONDecodeError, FileNotFoundError):
+            return None
+
+def save_user_state(user_id, state):
+    with file_lock:
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                states = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            states = {}
+
+        if state is None:
+            states.pop(str(user_id), None)
+        else:
+            states[str(user_id)] = state
+
+        try:
+            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(states, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f'Ошибка записи user_states.json: {e}')
 
 init_storage()
 
 def return_to_main_menu(message):
+    save_user_state(message.from_user.id, None)  # Очищаем состояние
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn1 = types.KeyboardButton('➕ Добавить событие')
     btn2 = types.KeyboardButton('📋 Мои события')
@@ -54,6 +103,7 @@ def startBot(message):
 
 @bot.message_handler(commands=['add'])
 def add_event_start(message):
+    save_user_state(message.from_user.id, {'step': 'waiting_name'})
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn_cancel = types.KeyboardButton('❌ Отмена')
     markup.add(btn_cancel)
@@ -67,6 +117,7 @@ def get_event_name(message):
         return_to_main_menu(message)
         return
     event_name = message.text
+    save_user_state(message.from_user.id, {'step': 'waiting_description', 'event_name': event_name})
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn_cancel = types.KeyboardButton('❌ Отмена')
     markup.add(btn_cancel)
@@ -78,6 +129,11 @@ def get_event_description(message, event_name):
         return_to_main_menu(message)
         return
     description = message.text
+    save_user_state(message.from_user.id, {
+        'step': 'waiting_time',
+        'event_name': event_name,
+        'description': description
+    })
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn_cancel = types.KeyboardButton('❌ Отмена')
     markup.add(btn_cancel)
@@ -115,6 +171,7 @@ def get_event_time(message, event_name, description):
 
         data['events'].append(new_event)
         save_events(data)
+        save_user_state(message.from_user.id, None)  # Очищаем состояние
 
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
         btn1 = types.KeyboardButton('➕ Добавить событие')
@@ -159,6 +216,7 @@ def list_events(message):
 
 @bot.message_handler(commands=['delete'])
 def delete_event_start(message):
+    save_user_state(message.from_user.id, {'step': 'waiting_delete_id'})
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn_cancel = types.KeyboardButton('❌ Отмена')
     markup.add(btn_cancel)
@@ -180,6 +238,8 @@ def delete_event(message):
         data['events'] = [e for e in data['events']
                          if not (e['id'] == event_id and e['user_id'] == message.from_user.id)]
 
+        save_user_state(message.from_user.id, None)  # Очищаем состояние
+
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
         btn1 = types.KeyboardButton('➕ Добавить событие')
         btn2 = types.KeyboardButton('📋 Мои события')
@@ -196,6 +256,29 @@ def delete_event(message):
 
 @bot.message_handler()
 def get_info(message):
+    # Проверяем, есть ли сохраненное состояние пользователя
+    user_state = load_user_state(message.from_user.id)
+
+    if user_state:
+        step = user_state.get('step')
+
+        if step == 'waiting_name':
+            get_event_name(message)
+            return
+        elif step == 'waiting_description':
+            event_name = user_state.get('event_name', '')
+            get_event_description(message, event_name)
+            return
+        elif step == 'waiting_time':
+            event_name = user_state.get('event_name', '')
+            description = user_state.get('description', '')
+            get_event_time(message, event_name, description)
+            return
+        elif step == 'waiting_delete_id':
+            delete_event(message)
+            return
+
+    # Обычная обработка команд
     if message.text == '➕ Добавить событие':
         add_event_start(message)
     elif message.text == '📋 Мои события':
